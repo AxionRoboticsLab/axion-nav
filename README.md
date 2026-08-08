@@ -24,7 +24,7 @@ Axion 机器人 **定位 + 导航到目标** 服务。基于 **ROS 2 Humble**。
 |------|------|
 | **axion-slam** | `/map_command`、地图文件、`/map` |
 | **axion-nav** | `/initialpose`、`/goal_pose`、`/robot_pose`、`/plan` |
-| **axion-console** | 导航页：重定位 / 去这里 / 收藏点 |
+| **axion-console** | 导航页：重定位 / 去这里 / 巡检点 |
 
 建图时由 slam 发布 `/robot_pose`；**idle 载图后** slam 不再发 pose，由本包 mock 接管，避免双节点抢话题。
 
@@ -35,7 +35,7 @@ Axion 机器人 **定位 + 导航到目标** 服务。基于 **ROS 2 Humble**。
 | 接口 | 类型 | 方向 | 说明 |
 |------|------|------|------|
 | `/initialpose` | `geometry_msgs/PoseWithCovarianceStamped` | 入 | 重定位 |
-| `/goal_pose` | `geometry_msgs/PoseStamped` | 入 | 去这里 / 收藏点（对齐 Nav2 Simple Goal） |
+| `/goal_pose` | `geometry_msgs/PoseStamped` | 入 | 去这里 / 巡检点（对齐 Nav2 Simple Goal） |
 | `/cmd_vel` | `geometry_msgs/Twist` | 入 | 摇杆；有速度时取消当前 goal |
 | `/robot_pose` | `geometry_msgs/PoseStamped` | 出 | 前端机器人箭头 |
 | `/plan` | `nav_msgs/Path` | 出 | 当前直线路径（可视化） |
@@ -67,7 +67,7 @@ ros2 launch axion_nav bringup.launch.py
 
 1. 打开 **导航** 页，加载地图（如 `v1`）
 2. **重定位**：点地图设位姿 → 确定 → 发 `/initialpose`
-3. **去这里**（或点收藏点）→ 发 `/goal_pose` → 箭头沿直线移动，`/plan` 可画路径
+3. **去这里**（或点巡检点）→ 发 `/goal_pose` → 箭头沿直线移动，`/plan` 可画路径
 
 ---
 

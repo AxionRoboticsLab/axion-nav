@@ -59,7 +59,7 @@ double normalize_angle(double a)
  *
  * 协议（与 console / 未来 Nav2 对齐）:
  *   /initialpose  PoseWithCovarianceStamped  ← 重定位
- *   /goal_pose    PoseStamped                ← 去这里 / 收藏点
+ *   /goal_pose    PoseStamped                ← 去这里 / 巡检点
  *   /cmd_vel      Twist                      ← 摇杆（有速度时取消导航）
  *   /robot_pose   PoseStamped                → 前端箭头
  *   /plan         Path                       → 直线路径可视化
