@@ -1,0 +1,15 @@
+mock_nav:
+  ros__parameters:
+    pose_rate_hz: 20.0
+    teleop_scale: 8.0
+    # 直线 mock 导航线速度 / 角速度上限
+    nav_linear_speed: 0.35
+    nav_angular_speed: 1.2
+    goal_xy_tolerance: 0.08
+    goal_yaw_tolerance: 0.15
+    cmd_vel_topic: /cmd_vel
+    initialpose_topic: /initialpose
+    goal_pose_topic: /goal_pose
+    robot_pose_topic: /robot_pose
+    plan_topic: /plan
+    nav_state_topic: /nav_state
