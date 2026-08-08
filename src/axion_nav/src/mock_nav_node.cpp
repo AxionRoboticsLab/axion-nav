@@ -117,12 +117,18 @@ public:
 
     auto on_cmd = [this](const geometry_msgs::msg::Twist::SharedPtr msg) {
       std::lock_guard<std::mutex> lock(mutex_);
+      const double speed =
+        std::hypot(msg->linear.x, msg->linear.y) + std::abs(msg->angular.z);
+      // 摇杆松手会发一次 0 速；不能把 has_cmd 当成“占着导航”
+      if (speed <= 1e-3) {
+        has_cmd_ = false;
+        last_cmd_ = geometry_msgs::msg::Twist();
+        return;
+      }
       last_cmd_ = *msg;
       last_cmd_time_ = now();
       has_cmd_ = true;
-      const double speed =
-        std::hypot(msg->linear.x, msg->linear.y) + std::abs(msg->angular.z);
-      if (navigating_ && speed > 1e-3) {
+      if (navigating_) {
         navigating_ = false;
         set_state_locked("idle");
         clear_plan_locked();
@@ -234,11 +240,14 @@ private:
     std::lock_guard<std::mutex> lock(mutex_);
     const double dt = 1.0 / std::max(1.0, pose_rate_hz_);
 
-    // Teleop has priority when stick is active.
+    // 仅非零 cmd_vel 抢占导航；零速/超时不挡 goal
     bool teleop_active = false;
     if (has_cmd_) {
       const double age = (now() - last_cmd_time_).seconds();
-      if (age < 0.5) {
+      const double speed =
+        std::hypot(last_cmd_.linear.x, last_cmd_.linear.y) +
+        std::abs(last_cmd_.angular.z);
+      if (age < 0.5 && speed > 1e-3) {
         teleop_active = true;
         const double scale = std::max(0.1, teleop_scale_);
         const double vx = last_cmd_.linear.x * scale;
@@ -249,6 +258,8 @@ private:
         pose_x_ += (c * vx - s * vy) * dt;
         pose_y_ += (s * vx + c * vy) * dt;
         pose_yaw_ = normalize_angle(pose_yaw_ + wz * dt);
+      } else if (age >= 0.5) {
+        has_cmd_ = false;
       }
     }
 
