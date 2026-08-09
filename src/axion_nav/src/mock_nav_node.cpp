@@ -2,6 +2,7 @@
 #include <chrono>
 #include <cmath>
 #include <mutex>
+#include <sstream>
 #include <string>
 
 #ifndef M_PI
@@ -79,6 +80,8 @@ void move_forward(double yaw, double step, double & x, double & y)
  *   /robot_pose   PoseStamped                → 前端箭头
  *   /plan         Path                       → 直线路径可视化
  *   /nav_state    String                     → idle | navigating | arrived
+ *   /robot_status String(JSON)               → 电量/充电/机型等（status_rate_hz）
+ *   /charge_pose  PoseStamped                ← 充电点（console 下发，用于判断充电中）
  */
 class MockNavNode : public rclcpp::Node
 {
@@ -87,11 +90,17 @@ public:
   : Node("mock_nav")
   {
     pose_rate_hz_ = declare_parameter<double>("pose_rate_hz", 20.0);
+    status_rate_hz_ = declare_parameter<double>("status_rate_hz", 1.0);
     teleop_scale_ = declare_parameter<double>("teleop_scale", 8.0);
     nav_linear_speed_ = declare_parameter<double>("nav_linear_speed", 0.35);
     nav_angular_speed_ = declare_parameter<double>("nav_angular_speed", 1.2);
     goal_xy_tol_ = declare_parameter<double>("goal_xy_tolerance", 0.08);
     goal_yaw_tol_ = declare_parameter<double>("goal_yaw_tolerance", 0.15);
+    charge_near_m_ = declare_parameter<double>("charge_near_m", 0.35);
+    battery_ = declare_parameter<int>("battery_percent", 100);
+    model_ = declare_parameter<std::string>("robot_model", "Demo-v1");
+    version_ = declare_parameter<std::string>("robot_version", "v0.1.0");
+    sn_ = declare_parameter<std::string>("robot_sn", "AX-DEMO-0001");
 
     const auto cmd_vel_topic = declare_parameter<std::string>("cmd_vel_topic", "/cmd_vel");
     const auto initialpose_topic =
@@ -102,11 +111,16 @@ public:
     const auto plan_topic = declare_parameter<std::string>("plan_topic", "/plan");
     const auto nav_state_topic =
       declare_parameter<std::string>("nav_state_topic", "/nav_state");
+    const auto robot_status_topic =
+      declare_parameter<std::string>("robot_status_topic", "/robot_status");
+    const auto charge_pose_topic =
+      declare_parameter<std::string>("charge_pose_topic", "/charge_pose");
 
     pose_pub_ = create_publisher<geometry_msgs::msg::PoseStamped>(
       robot_pose_topic, bridge_sub_qos());
     plan_pub_ = create_publisher<nav_msgs::msg::Path>(plan_topic, bridge_pub_qos());
     state_pub_ = create_publisher<std_msgs::msg::String>(nav_state_topic, bridge_pub_qos());
+    status_pub_ = create_publisher<std_msgs::msg::String>(robot_status_topic, bridge_pub_qos());
 
     initialpose_sub_ = create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
       initialpose_topic, bridge_sub_qos(),
@@ -157,6 +171,17 @@ public:
     cmd_vel_sub_rel_ = create_subscription<geometry_msgs::msg::Twist>(
       cmd_vel_topic, bridge_pub_qos(), on_cmd);
 
+    auto on_charge = [this](const geometry_msgs::msg::PoseStamped::SharedPtr msg) {
+      on_charge_pose(msg);
+    };
+    charge_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
+      charge_pose_topic, bridge_sub_qos(), on_charge);
+    charge_sub_rel_ = create_subscription<geometry_msgs::msg::PoseStamped>(
+      charge_pose_topic, bridge_pub_qos(), on_charge);
+
+    battery_ = std::clamp(battery_, 0, 100);
+    last_battery_tick_ = now();
+
     const auto period = std::chrono::duration<double>(1.0 / std::max(1.0, pose_rate_hz_));
     timer_ = create_wall_timer(
       std::chrono::duration_cast<std::chrono::milliseconds>(period),
@@ -165,8 +190,9 @@ public:
     set_state_locked("idle");
     RCLCPP_INFO(
       get_logger(),
-      "mock_nav ready. initialpose=%s goal=%s pose=%s",
-      initialpose_topic.c_str(), goal_pose_topic.c_str(), robot_pose_topic.c_str());
+      "mock_nav ready. pose=%s status=%s @ %.1fHz charge_pose=%s",
+      robot_pose_topic.c_str(), robot_status_topic.c_str(), status_rate_hz_,
+      charge_pose_topic.c_str());
   }
 
 private:
@@ -197,6 +223,16 @@ private:
     RCLCPP_INFO(
       get_logger(), "initialpose -> (%.2f, %.2f, yaw=%.2f)",
       pose_x_, pose_y_, pose_yaw_);
+  }
+
+  void on_charge_pose(const geometry_msgs::msg::PoseStamped::SharedPtr msg)
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    charge_x_ = msg->pose.position.x;
+    charge_y_ = msg->pose.position.y;
+    has_charge_ = true;
+    RCLCPP_INFO(
+      get_logger(), "charge_pose -> (%.2f, %.2f)", charge_x_, charge_y_);
   }
 
   void on_goal(const geometry_msgs::msg::PoseStamped::SharedPtr msg)
@@ -265,6 +301,55 @@ private:
     msg.pose.position.z = 0.0;
     msg.pose.orientation = quat_from_yaw(pose_yaw_);
     pose_pub_->publish(msg);
+  }
+
+  bool near_charge_locked() const
+  {
+    if (!has_charge_) {
+      return false;
+    }
+    return std::hypot(pose_x_ - charge_x_, pose_y_ - charge_y_) <= charge_near_m_;
+  }
+
+  /** 在充电点：每分钟 +1%；否则每分钟 -1% */
+  void update_battery_locked()
+  {
+    const double elapsed = (now() - last_battery_tick_).seconds();
+    if (elapsed < 60.0) {
+      return;
+    }
+    const int mins = static_cast<int>(elapsed / 60.0);
+    charging_ = near_charge_locked();
+    const int delta = charging_ ? mins : -mins;
+    battery_ = std::clamp(battery_ + delta, 0, 100);
+    last_battery_tick_ = last_battery_tick_ + rclcpp::Duration::from_seconds(mins * 60.0);
+  }
+
+  void publish_status_locked()
+  {
+    charging_ = near_charge_locked();
+    std::string work = "idle";
+    if (nav_state_ == "navigating") {
+      work = "navigating";
+    } else if (nav_state_ == "arrived") {
+      work = "idle";
+    }
+
+    std::ostringstream oss;
+    oss << '{'
+        << "\"battery\":" << battery_ << ','
+        << "\"charging\":" << (charging_ ? "true" : "false") << ','
+        << "\"model\":\"" << model_ << "\","
+        << "\"version\":\"" << version_ << "\","
+        << "\"sn\":\"" << sn_ << "\","
+        << "\"online\":true,"
+        << "\"work_state\":\"" << work << "\","
+        << "\"nav_state\":\"" << nav_state_ << "\""
+        << '}';
+
+    std_msgs::msg::String msg;
+    msg.data = oss.str();
+    status_pub_->publish(msg);
   }
 
   void on_timer()
@@ -345,15 +430,27 @@ private:
     }
 
     publish_pose_locked();
+
+    // 机器人状态：默认 1Hz 推送 JSON（电量 / 充电 / 机型…）
+    status_accum_ += dt;
+    const double status_period = 1.0 / std::max(0.1, status_rate_hz_);
+    if (status_accum_ >= status_period) {
+      status_accum_ = 0.0;
+      update_battery_locked();
+      publish_status_locked();
+    }
   }
 
   double pose_rate_hz_{20.0};
+  double status_rate_hz_{1.0};
   double teleop_scale_{8.0};
   double nav_linear_speed_{0.35};
   double nav_angular_speed_{1.2};
   double goal_xy_tol_{0.08};
   double goal_yaw_tol_{0.15};
   double bearing_yaw_tol_{0.08};
+  double charge_near_m_{0.35};
+  double status_accum_{0.0};
 
   double pose_x_{0.0};
   double pose_y_{0.0};
@@ -365,6 +462,14 @@ private:
   double plan_start_y_{0.0};
   double plan_start_yaw_{0.0};
   double drive_yaw_{0.0};
+  double charge_x_{0.0};
+  double charge_y_{0.0};
+  bool has_charge_{false};
+  bool charging_{false};
+  int battery_{100};
+  std::string model_{"Demo-v1"};
+  std::string version_{"v0.1.0"};
+  std::string sn_{"AX-DEMO-0001"};
   bool has_goal_{false};
   bool navigating_{false};
   bool pending_idle_{false};
@@ -373,12 +478,14 @@ private:
 
   geometry_msgs::msg::Twist last_cmd_;
   rclcpp::Time last_cmd_time_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_battery_tick_{0, 0, RCL_ROS_TIME};
   bool has_cmd_{false};
 
   std::mutex mutex_;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr plan_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr state_pub_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr
     initialpose_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr
@@ -387,6 +494,8 @@ private:
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr goal_sub_rel_;
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_sub_;
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_sub_rel_;
+  rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr charge_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr charge_sub_rel_;
   rclcpp::TimerBase::SharedPtr timer_;
 };
 

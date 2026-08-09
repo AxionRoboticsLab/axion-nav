@@ -40,6 +40,23 @@ Axion 机器人 **定位 + 导航到目标** 服务。基于 **ROS 2 Humble**。
 | `/robot_pose` | `geometry_msgs/PoseStamped` | 出 | 前端机器人箭头 |
 | `/plan` | `nav_msgs/Path` | 出 | 当前直线路径（可视化） |
 | `/nav_state` | `std_msgs/String` | 出 | `idle` / `navigating` / `arrived` |
+| `/robot_status` | `std_msgs/String` (JSON) | 出 | 电量/充电/机型等，默认 **1 Hz**（`status_rate_hz`） |
+| `/charge_pose` | `geometry_msgs/PoseStamped` | 入 | 充电点；靠近则 `charging=true`，每分钟电量 +1%，否则 -1% |
+
+`/robot_status` JSON 示例：
+
+```json
+{
+  "battery": 100,
+  "charging": false,
+  "model": "Demo-v1",
+  "version": "v0.1.0",
+  "sn": "AX-DEMO-0001",
+  "online": true,
+  "work_state": "idle",
+  "nav_state": "idle"
+}
+```
 
 > 真实 Nav2 阶段将改为 AMCL + `navigate_to_pose` Action；`/goal_pose` 话题可保留作薄桥接。
 

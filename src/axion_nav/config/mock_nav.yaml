@@ -1,15 +1,24 @@
 mock_nav:
   ros__parameters:
     pose_rate_hz: 20.0
+    # 机器人状态 /robot_status 推送频率（Hz）
+    status_rate_hz: 1.0
     teleop_scale: 8.0
     # 直线 mock 导航线速度 / 角速度上限
     nav_linear_speed: 0.35
     nav_angular_speed: 1.2
     goal_xy_tolerance: 0.08
     goal_yaw_tolerance: 0.15
+    charge_near_m: 0.35
+    battery_percent: 100
+    robot_model: Demo-v1
+    robot_version: v0.1.0
+    robot_sn: AX-DEMO-0001
     cmd_vel_topic: /cmd_vel
     initialpose_topic: /initialpose
     goal_pose_topic: /goal_pose
     robot_pose_topic: /robot_pose
     plan_topic: /plan
     nav_state_topic: /nav_state
+    robot_status_topic: /robot_status
+    charge_pose_topic: /charge_pose
