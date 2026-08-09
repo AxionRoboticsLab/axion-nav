@@ -130,6 +130,8 @@ public:
       has_cmd_ = true;
       if (navigating_) {
         navigating_ = false;
+        phase_ = NavPhase::Idle;
+        pending_idle_ = false;
         set_state_locked("idle");
         clear_plan_locked();
         RCLCPP_INFO(get_logger(), "goal cancelled by teleop");
@@ -153,6 +155,8 @@ public:
   }
 
 private:
+  enum class NavPhase { Idle, AlignBearing, Drive, AlignGoal };
+
   void set_state_locked(const std::string & s)
   {
     if (nav_state_ == s) {
@@ -171,6 +175,8 @@ private:
     pose_y_ = msg->pose.pose.position.y;
     pose_yaw_ = yaw_from_quat(msg->pose.pose.orientation);
     navigating_ = false;
+    phase_ = NavPhase::Idle;
+    pending_idle_ = false;
     set_state_locked("idle");
     clear_plan_locked();
     RCLCPP_INFO(
@@ -190,6 +196,10 @@ private:
     plan_start_yaw_ = pose_yaw_;
     has_goal_ = true;
     navigating_ = true;
+    pending_idle_ = false;
+    // 三相：先对目标方位 → 直线前进 → 到位后转目标朝向
+    const double already = std::hypot(goal_x_ - pose_x_, goal_y_ - pose_y_);
+    phase_ = already <= goal_xy_tol_ ? NavPhase::AlignGoal : NavPhase::AlignBearing;
     set_state_locked("navigating");
     publish_plan_locked();
     RCLCPP_INFO(
@@ -270,28 +280,39 @@ private:
       }
     }
 
-    if (!teleop_active && navigating_ && has_goal_) {
-      const double dx = goal_x_ - pose_x_;
-      const double dy = goal_y_ - pose_y_;
-      const double dist = std::hypot(dx, dy);
-      const double bearing = std::atan2(dy, dx);
-      const double yaw_err = normalize_angle(bearing - pose_yaw_);
+    // arrived 保留一拍，再进 idle，方便前端连跑巡检
+    if (pending_idle_ && !navigating_) {
+      pending_idle_ = false;
+      set_state_locked("idle");
+    }
 
-      if (dist > goal_xy_tol_) {
-        // 先转再走（简易差速）
-        if (std::abs(yaw_err) > 0.25) {
+    if (!teleop_active && navigating_ && has_goal_) {
+      if (phase_ == NavPhase::AlignBearing) {
+        const double bearing = std::atan2(goal_y_ - pose_y_, goal_x_ - pose_x_);
+        const double yaw_err = normalize_angle(bearing - pose_yaw_);
+        if (std::abs(yaw_err) > bearing_yaw_tol_) {
           const double wz = std::clamp(
             yaw_err * 2.0, -nav_angular_speed_, nav_angular_speed_);
           pose_yaw_ = normalize_angle(pose_yaw_ + wz * dt);
         } else {
-          const double step = std::min(nav_linear_speed_ * dt, dist);
-          pose_x_ += std::cos(pose_yaw_) * step;
-          pose_y_ += std::sin(pose_yaw_) * step;
-          const double wz = std::clamp(
-            yaw_err * 1.5, -nav_angular_speed_, nav_angular_speed_);
-          pose_yaw_ = normalize_angle(pose_yaw_ + wz * dt);
+          drive_yaw_ = bearing;
+          pose_yaw_ = bearing;
+          phase_ = NavPhase::Drive;
         }
-      } else {
+      } else if (phase_ == NavPhase::Drive) {
+        const double dx = goal_x_ - pose_x_;
+        const double dy = goal_y_ - pose_y_;
+        const double dist = std::hypot(dx, dy);
+        if (dist > goal_xy_tol_) {
+          // 锁定行驶朝向，直线前进（不再边走边扭）
+          const double step = std::min(nav_linear_speed_ * dt, dist);
+          pose_x_ += std::cos(drive_yaw_) * step;
+          pose_y_ += std::sin(drive_yaw_) * step;
+          pose_yaw_ = drive_yaw_;
+        } else {
+          phase_ = NavPhase::AlignGoal;
+        }
+      } else if (phase_ == NavPhase::AlignGoal) {
         const double final_err = normalize_angle(goal_yaw_ - pose_yaw_);
         if (std::abs(final_err) > goal_yaw_tol_) {
           const double wz = std::clamp(
@@ -300,11 +321,11 @@ private:
         } else {
           pose_yaw_ = goal_yaw_;
           navigating_ = false;
+          phase_ = NavPhase::Idle;
           set_state_locked("arrived");
           clear_plan_locked();
+          pending_idle_ = true;
           RCLCPP_INFO(get_logger(), "arrived at goal");
-          // 短暂停留在 arrived，下一拍回到 idle 方便前端轮询
-          set_state_locked("idle");
         }
       }
     }
@@ -318,6 +339,7 @@ private:
   double nav_angular_speed_{1.2};
   double goal_xy_tol_{0.08};
   double goal_yaw_tol_{0.15};
+  double bearing_yaw_tol_{0.08};
 
   double pose_x_{0.0};
   double pose_y_{0.0};
@@ -328,8 +350,11 @@ private:
   double plan_start_x_{0.0};
   double plan_start_y_{0.0};
   double plan_start_yaw_{0.0};
+  double drive_yaw_{0.0};
   bool has_goal_{false};
   bool navigating_{false};
+  bool pending_idle_{false};
+  NavPhase phase_{NavPhase::Idle};
   std::string nav_state_{"idle"};
 
   geometry_msgs::msg::Twist last_cmd_;
