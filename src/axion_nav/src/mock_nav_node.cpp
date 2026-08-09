@@ -184,6 +184,10 @@ private:
     goal_x_ = msg->pose.position.x;
     goal_y_ = msg->pose.position.y;
     goal_yaw_ = yaw_from_quat(msg->pose.orientation);
+    // 固定全局路径起点，便于前端画「已走/未走」
+    plan_start_x_ = pose_x_;
+    plan_start_y_ = pose_y_;
+    plan_start_yaw_ = pose_yaw_;
     has_goal_ = true;
     navigating_ = true;
     set_state_locked("navigating");
@@ -203,23 +207,26 @@ private:
 
   void publish_plan_locked()
   {
+    // 发布固定折线（起点→目标），行驶过程中不再改起点
     nav_msgs::msg::Path path;
     path.header.stamp = now();
     path.header.frame_id = "map";
 
-    geometry_msgs::msg::PoseStamped a;
-    a.header = path.header;
-    a.pose.position.x = pose_x_;
-    a.pose.position.y = pose_y_;
-    a.pose.orientation = quat_from_yaw(pose_yaw_);
-
-    geometry_msgs::msg::PoseStamped b;
-    b.header = path.header;
-    b.pose.position.x = goal_x_;
-    b.pose.position.y = goal_y_;
-    b.pose.orientation = quat_from_yaw(goal_yaw_);
-
-    path.poses = {a, b};
+    constexpr int k_segments = 24;
+    path.poses.reserve(static_cast<size_t>(k_segments) + 1);
+    for (int i = 0; i <= k_segments; ++i) {
+      const double t = static_cast<double>(i) / static_cast<double>(k_segments);
+      geometry_msgs::msg::PoseStamped p;
+      p.header = path.header;
+      p.pose.position.x = plan_start_x_ + (goal_x_ - plan_start_x_) * t;
+      p.pose.position.y = plan_start_y_ + (goal_y_ - plan_start_y_) * t;
+      p.pose.position.z = 0.0;
+      const double yaw = (i < k_segments)
+        ? std::atan2(goal_y_ - plan_start_y_, goal_x_ - plan_start_x_)
+        : goal_yaw_;
+      p.pose.orientation = quat_from_yaw(yaw);
+      path.poses.push_back(p);
+    }
     plan_pub_->publish(path);
   }
 
@@ -284,7 +291,6 @@ private:
             yaw_err * 1.5, -nav_angular_speed_, nav_angular_speed_);
           pose_yaw_ = normalize_angle(pose_yaw_ + wz * dt);
         }
-        publish_plan_locked();
       } else {
         const double final_err = normalize_angle(goal_yaw_ - pose_yaw_);
         if (std::abs(final_err) > goal_yaw_tol_) {
@@ -319,6 +325,9 @@ private:
   double goal_x_{0.0};
   double goal_y_{0.0};
   double goal_yaw_{0.0};
+  double plan_start_x_{0.0};
+  double plan_start_y_{0.0};
+  double plan_start_yaw_{0.0};
   bool has_goal_{false};
   bool navigating_{false};
   std::string nav_state_{"idle"};
