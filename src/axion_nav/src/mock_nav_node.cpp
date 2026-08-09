@@ -52,6 +52,21 @@ double normalize_angle(double a)
   }
   return a;
 }
+
+/**
+ * 与 axion-console 箭头一致：yaw=0 朝 map +Y（屏幕上），
+ * 前进方向为 (sin θ, cos θ)，而非 ROS 默认的 (cos θ, sin θ)。
+ */
+double bearing_to(double from_x, double from_y, double to_x, double to_y)
+{
+  return std::atan2(to_x - from_x, to_y - from_y);
+}
+
+void move_forward(double yaw, double step, double & x, double & y)
+{
+  x += std::sin(yaw) * step;
+  y += std::cos(yaw) * step;
+}
 }  // namespace
 
 /**
@@ -232,7 +247,7 @@ private:
       p.pose.position.y = plan_start_y_ + (goal_y_ - plan_start_y_) * t;
       p.pose.position.z = 0.0;
       const double yaw = (i < k_segments)
-        ? std::atan2(goal_y_ - plan_start_y_, goal_x_ - plan_start_x_)
+        ? bearing_to(plan_start_x_, plan_start_y_, goal_x_, goal_y_)
         : goal_yaw_;
       p.pose.orientation = quat_from_yaw(yaw);
       path.poses.push_back(p);
@@ -267,13 +282,14 @@ private:
       if (age < 0.5 && speed > 1e-3) {
         teleop_active = true;
         const double scale = std::max(0.1, teleop_scale_);
+        // 摇杆：x=右移，y=前进（与箭头朝向一致）
         const double vx = last_cmd_.linear.x * scale;
         const double vy = last_cmd_.linear.y * scale;
         const double wz = last_cmd_.angular.z * scale;
         const double c = std::cos(pose_yaw_);
         const double s = std::sin(pose_yaw_);
-        pose_x_ += (c * vx - s * vy) * dt;
-        pose_y_ += (s * vx + c * vy) * dt;
+        pose_x_ += (c * vx + s * vy) * dt;
+        pose_y_ += (-s * vx + c * vy) * dt;
         pose_yaw_ = normalize_angle(pose_yaw_ + wz * dt);
       } else if (age >= 0.5) {
         has_cmd_ = false;
@@ -288,7 +304,7 @@ private:
 
     if (!teleop_active && navigating_ && has_goal_) {
       if (phase_ == NavPhase::AlignBearing) {
-        const double bearing = std::atan2(goal_y_ - pose_y_, goal_x_ - pose_x_);
+        const double bearing = bearing_to(pose_x_, pose_y_, goal_x_, goal_y_);
         const double yaw_err = normalize_angle(bearing - pose_yaw_);
         if (std::abs(yaw_err) > bearing_yaw_tol_) {
           const double wz = std::clamp(
@@ -300,15 +316,13 @@ private:
           phase_ = NavPhase::Drive;
         }
       } else if (phase_ == NavPhase::Drive) {
-        const double dx = goal_x_ - pose_x_;
-        const double dy = goal_y_ - pose_y_;
-        const double dist = std::hypot(dx, dy);
+        const double dist = std::hypot(goal_x_ - pose_x_, goal_y_ - pose_y_);
         if (dist > goal_xy_tol_) {
-          // 锁定行驶朝向，直线前进（不再边走边扭）
-          const double step = std::min(nav_linear_speed_ * dt, dist);
-          pose_x_ += std::cos(drive_yaw_) * step;
-          pose_y_ += std::sin(drive_yaw_) * step;
+          // 始终朝向目标点，再沿箭头前进（禁止侧移/后移）
+          drive_yaw_ = bearing_to(pose_x_, pose_y_, goal_x_, goal_y_);
           pose_yaw_ = drive_yaw_;
+          const double step = std::min(nav_linear_speed_ * dt, dist);
+          move_forward(drive_yaw_, step, pose_x_, pose_y_);
         } else {
           phase_ = NavPhase::AlignGoal;
         }
