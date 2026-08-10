@@ -1,6 +1,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -14,6 +16,7 @@
 #include <geometry_msgs/msg/twist.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/string.hpp>
 
 namespace
@@ -77,10 +80,12 @@ void move_forward(double yaw, double step, double & x, double & y)
  *   /initialpose  PoseWithCovarianceStamped  ← 重定位
  *   /goal_pose    PoseStamped                ← 去这里 / 巡检点
  *   /cmd_vel      Twist                      ← 摇杆（有速度时取消导航）
+ *   /estop        Bool                       ← 急停（true 触发告警并停导航）
  *   /robot_pose   PoseStamped                → 前端箭头
  *   /plan         Path                       → 直线路径可视化
  *   /nav_state    String                     → idle | navigating | arrived
  *   /robot_status String(JSON)               → 电量/充电/机型等（status_rate_hz）
+ *   /alarm_event  String(JSON)               → 告警：定位失败/触边/急停
  *   /charge_pose  PoseStamped                ← 充电点（console 下发，用于判断充电中）
  */
 class MockNavNode : public rclcpp::Node
@@ -101,6 +106,10 @@ public:
     model_ = declare_parameter<std::string>("robot_model", "Demo-v1");
     version_ = declare_parameter<std::string>("robot_version", "v0.1.0");
     sn_ = declare_parameter<std::string>("robot_sn", "AX-DEMO-0001");
+    // 告警：定时轮播三种异常；0 关闭自动造异常
+    alarm_demo_period_sec_ = declare_parameter<double>("alarm_demo_period_sec", 45.0);
+    alarm_cooldown_sec_ = declare_parameter<double>("alarm_cooldown_sec", 25.0);
+    edge_bound_m_ = declare_parameter<double>("edge_bound_m", 4.5);
 
     const auto cmd_vel_topic = declare_parameter<std::string>("cmd_vel_topic", "/cmd_vel");
     const auto initialpose_topic =
@@ -115,12 +124,16 @@ public:
       declare_parameter<std::string>("robot_status_topic", "/robot_status");
     const auto charge_pose_topic =
       declare_parameter<std::string>("charge_pose_topic", "/charge_pose");
+    const auto alarm_event_topic =
+      declare_parameter<std::string>("alarm_event_topic", "/alarm_event");
+    const auto estop_topic = declare_parameter<std::string>("estop_topic", "/estop");
 
     pose_pub_ = create_publisher<geometry_msgs::msg::PoseStamped>(
       robot_pose_topic, bridge_sub_qos());
     plan_pub_ = create_publisher<nav_msgs::msg::Path>(plan_topic, bridge_pub_qos());
     state_pub_ = create_publisher<std_msgs::msg::String>(nav_state_topic, bridge_pub_qos());
     status_pub_ = create_publisher<std_msgs::msg::String>(robot_status_topic, bridge_pub_qos());
+    alarm_pub_ = create_publisher<std_msgs::msg::String>(alarm_event_topic, bridge_pub_qos());
 
     initialpose_sub_ = create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
       initialpose_topic, bridge_sub_qos(),
@@ -179,8 +192,17 @@ public:
     charge_sub_rel_ = create_subscription<geometry_msgs::msg::PoseStamped>(
       charge_pose_topic, bridge_pub_qos(), on_charge);
 
+    auto on_estop = [this](const std_msgs::msg::Bool::SharedPtr msg) {
+      on_estop_msg(msg);
+    };
+    estop_sub_ = create_subscription<std_msgs::msg::Bool>(
+      estop_topic, bridge_sub_qos(), on_estop);
+    estop_sub_rel_ = create_subscription<std_msgs::msg::Bool>(
+      estop_topic, bridge_pub_qos(), on_estop);
+
     battery_ = std::clamp(battery_, 0, 100);
     last_battery_tick_ = now();
+    last_alarm_demo_ = now();
 
     const auto period = std::chrono::duration<double>(1.0 / std::max(1.0, pose_rate_hz_));
     timer_ = create_wall_timer(
@@ -190,9 +212,9 @@ public:
     set_state_locked("idle");
     RCLCPP_INFO(
       get_logger(),
-      "mock_nav ready. pose=%s status=%s @ %.1fHz charge_pose=%s",
+      "mock_nav ready. pose=%s status=%s @ %.1fHz alarm=%s demo=%.0fs edge=%.1fm",
       robot_pose_topic.c_str(), robot_status_topic.c_str(), status_rate_hz_,
-      charge_pose_topic.c_str());
+      alarm_event_topic.c_str(), alarm_demo_period_sec_, edge_bound_m_);
   }
 
 private:
@@ -218,11 +240,110 @@ private:
     navigating_ = false;
     phase_ = NavPhase::Idle;
     pending_idle_ = false;
+    loc_ok_ = true;
+    edge_hit_ = false;
     set_state_locked("idle");
     clear_plan_locked();
     RCLCPP_INFO(
       get_logger(), "initialpose -> (%.2f, %.2f, yaw=%.2f)",
       pose_x_, pose_y_, pose_yaw_);
+  }
+
+  void on_estop_msg(const std_msgs::msg::Bool::SharedPtr msg)
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!msg->data) {
+      estop_ = false;
+      return;
+    }
+    apply_estop_locked("急停按钮触发，导航已中断");
+  }
+
+  void apply_estop_locked(const std::string & detail)
+  {
+    estop_ = true;
+    if (navigating_) {
+      navigating_ = false;
+      phase_ = NavPhase::Idle;
+      pending_idle_ = false;
+      set_state_locked("idle");
+      clear_plan_locked();
+    }
+    publish_alarm_locked(
+      "emergency_stop", "critical", "急停", detail);
+  }
+
+  /** 发布告警事件；同 code 在 cooldown 内去重 */
+  void publish_alarm_locked(
+    const std::string & code,
+    const std::string & level,
+    const std::string & event,
+    const std::string & detail)
+  {
+    const double t = now().seconds();
+    const auto it = last_alarm_by_code_.find(code);
+    if (it != last_alarm_by_code_.end() &&
+      (t - it->second) < alarm_cooldown_sec_)
+    {
+      return;
+    }
+    last_alarm_by_code_[code] = t;
+
+    if (code == "localization_lost") {
+      loc_ok_ = false;
+    } else if (code == "edge_collision") {
+      edge_hit_ = true;
+    } else if (code == "emergency_stop") {
+      estop_ = true;
+    }
+
+    std::ostringstream oss;
+    oss << '{'
+        << "\"code\":\"" << code << "\","
+        << "\"level\":\"" << level << "\","
+        << "\"event\":\"" << event << "\","
+        << "\"detail\":\"" << detail << "\","
+        << "\"source\":\"mock_nav\","
+        << "\"ts\":" << static_cast<std::int64_t>(t)
+        << '}';
+    std_msgs::msg::String msg;
+    msg.data = oss.str();
+    alarm_pub_->publish(msg);
+    RCLCPP_WARN(get_logger(), "alarm_event %s: %s", code.c_str(), event.c_str());
+  }
+
+  void maybe_demo_alarm_locked(double dt)
+  {
+    if (alarm_demo_period_sec_ <= 0.0) {
+      return;
+    }
+    alarm_demo_accum_ += dt;
+    if (alarm_demo_accum_ < alarm_demo_period_sec_) {
+      return;
+    }
+    alarm_demo_accum_ = 0.0;
+    const int step = alarm_demo_idx_ % 3;
+    alarm_demo_idx_ += 1;
+    if (step == 0) {
+      publish_alarm_locked(
+        "localization_lost", "critical", "定位失败",
+        "mock: AMCL/定位置信度过低（演示注入）");
+    } else if (step == 1) {
+      publish_alarm_locked(
+        "edge_collision", "warn", "触边",
+        "mock: 保险杠/触边传感器触发（演示注入）");
+    } else {
+      apply_estop_locked("mock: 急停回路断开（演示注入）");
+    }
+  }
+
+  void maybe_edge_alarm_locked()
+  {
+    if (std::abs(pose_x_) > edge_bound_m_ || std::abs(pose_y_) > edge_bound_m_) {
+      publish_alarm_locked(
+        "edge_collision", "warn", "触边",
+        "机器人接近虚拟边界，疑似触边");
+    }
   }
 
   void on_charge_pose(const geometry_msgs::msg::PoseStamped::SharedPtr msg)
@@ -238,6 +359,13 @@ private:
   void on_goal(const geometry_msgs::msg::PoseStamped::SharedPtr msg)
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (estop_) {
+      RCLCPP_WARN(get_logger(), "goal ignored: estop active");
+      publish_alarm_locked(
+        "emergency_stop", "critical", "急停",
+        "急停生效中，拒绝导航目标");
+      return;
+    }
     goal_x_ = msg->pose.position.x;
     goal_y_ = msg->pose.position.y;
     goal_yaw_ = yaw_from_quat(msg->pose.orientation);
@@ -344,7 +472,10 @@ private:
         << "\"sn\":\"" << sn_ << "\","
         << "\"online\":true,"
         << "\"work_state\":\"" << work << "\","
-        << "\"nav_state\":\"" << nav_state_ << "\""
+        << "\"nav_state\":\"" << nav_state_ << "\","
+        << "\"estop\":" << (estop_ ? "true" : "false") << ','
+        << "\"loc_ok\":" << (loc_ok_ ? "true" : "false") << ','
+        << "\"edge_hit\":" << (edge_hit_ ? "true" : "false")
         << '}';
 
     std_msgs::msg::String msg;
@@ -387,7 +518,7 @@ private:
       set_state_locked("idle");
     }
 
-    if (!teleop_active && navigating_ && has_goal_) {
+    if (!teleop_active && navigating_ && has_goal_ && !estop_) {
       if (phase_ == NavPhase::AlignBearing) {
         const double bearing = bearing_to(pose_x_, pose_y_, goal_x_, goal_y_);
         const double yaw_err = normalize_angle(bearing - pose_yaw_);
@@ -431,6 +562,9 @@ private:
 
     publish_pose_locked();
 
+    maybe_edge_alarm_locked();
+    maybe_demo_alarm_locked(dt);
+
     // 机器人状态：默认 1Hz 推送 JSON（电量 / 充电 / 机型…）
     status_accum_ += dt;
     const double status_period = 1.0 / std::max(0.1, status_rate_hz_);
@@ -451,6 +585,11 @@ private:
   double bearing_yaw_tol_{0.08};
   double charge_near_m_{0.35};
   double status_accum_{0.0};
+  double alarm_demo_period_sec_{45.0};
+  double alarm_cooldown_sec_{25.0};
+  double edge_bound_m_{4.5};
+  double alarm_demo_accum_{0.0};
+  int alarm_demo_idx_{0};
 
   double pose_x_{0.0};
   double pose_y_{0.0};
@@ -466,6 +605,9 @@ private:
   double charge_y_{0.0};
   bool has_charge_{false};
   bool charging_{false};
+  bool estop_{false};
+  bool loc_ok_{true};
+  bool edge_hit_{false};
   int battery_{100};
   std::string model_{"Demo-v1"};
   std::string version_{"v0.1.0"};
@@ -475,10 +617,12 @@ private:
   bool pending_idle_{false};
   NavPhase phase_{NavPhase::Idle};
   std::string nav_state_{"idle"};
+  std::map<std::string, double> last_alarm_by_code_;
 
   geometry_msgs::msg::Twist last_cmd_;
   rclcpp::Time last_cmd_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_battery_tick_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_alarm_demo_{0, 0, RCL_ROS_TIME};
   bool has_cmd_{false};
 
   std::mutex mutex_;
@@ -486,6 +630,7 @@ private:
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr plan_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr state_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr alarm_pub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr
     initialpose_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr
@@ -496,6 +641,8 @@ private:
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_sub_rel_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr charge_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr charge_sub_rel_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr estop_sub_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr estop_sub_rel_;
   rclcpp::TimerBase::SharedPtr timer_;
 };
 

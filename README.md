@@ -41,6 +41,8 @@ Axion 机器人 **定位 + 导航到目标** 服务。基于 **ROS 2 Humble**。
 | `/plan` | `nav_msgs/Path` | 出 | 当前直线路径（可视化） |
 | `/nav_state` | `std_msgs/String` | 出 | `idle` / `navigating` / `arrived` |
 | `/robot_status` | `std_msgs/String` (JSON) | 出 | 电量/充电/机型等，默认 **1 Hz**（`status_rate_hz`） |
+| `/alarm_event` | `std_msgs/String` (JSON) | 出 | 告警：定位失败 / 触边 / 急停（`alarm_demo_period_sec` 轮播） |
+| `/estop` | `std_msgs/Bool` | 入 | 急停；`true` 停导航并上报告警 |
 | `/charge_pose` | `geometry_msgs/PoseStamped` | 入 | 充电点；靠近则 `charging=true`，每分钟电量 +1%，否则 -1% |
 
 `/robot_status` JSON 示例：
@@ -54,7 +56,23 @@ Axion 机器人 **定位 + 导航到目标** 服务。基于 **ROS 2 Humble**。
   "sn": "AX-DEMO-0001",
   "online": true,
   "work_state": "idle",
-  "nav_state": "idle"
+  "nav_state": "idle",
+  "estop": false,
+  "loc_ok": true,
+  "edge_hit": false
+}
+```
+
+`/alarm_event` JSON 示例：
+
+```json
+{
+  "code": "localization_lost",
+  "level": "critical",
+  "event": "定位失败",
+  "detail": "mock: AMCL/定位置信度过低（演示注入）",
+  "source": "mock_nav",
+  "ts": 1723280000
 }
 ```
 
