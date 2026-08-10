@@ -14,12 +14,12 @@ mock_nav:
     robot_model: Demo-v1
     robot_version: v0.1.0
     robot_sn: AX-DEMO-0001
-    # 告警演示：每隔 N 秒轮播 定位失败→触边→急停；0=关闭
-    alarm_demo_period_sec: 45.0
+    # 告警演示注入关闭（0）；异常由自动测试稍后往 /alarm_event 注入
+    alarm_demo_period_sec: 0.0
     alarm_cooldown_sec: 25.0
-    # 演示急停保持秒数（到期自动解除，避免卡死巡检）
     alarm_demo_estop_hold_sec: 8.0
-    # |x| 或 |y| 超过该值视为触边
+    # 关闭自动触边告警；测试注入时再开
+    edge_alarm_enable: false
     edge_bound_m: 4.5
     cmd_vel_topic: /cmd_vel
     initialpose_topic: /initialpose

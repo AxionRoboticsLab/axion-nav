@@ -106,10 +106,11 @@ public:
     model_ = declare_parameter<std::string>("robot_model", "Demo-v1");
     version_ = declare_parameter<std::string>("robot_version", "v0.1.0");
     sn_ = declare_parameter<std::string>("robot_sn", "AX-DEMO-0001");
-    // 告警：定时轮播三种异常；0 关闭自动造异常
-    alarm_demo_period_sec_ = declare_parameter<double>("alarm_demo_period_sec", 45.0);
+    // 告警：默认不自动造异常（由自动测试往 /alarm_event 注入）；0=关闭轮播
+    alarm_demo_period_sec_ = declare_parameter<double>("alarm_demo_period_sec", 0.0);
     alarm_cooldown_sec_ = declare_parameter<double>("alarm_cooldown_sec", 25.0);
     alarm_demo_estop_hold_sec_ = declare_parameter<double>("alarm_demo_estop_hold_sec", 8.0);
+    edge_alarm_enable_ = declare_parameter<bool>("edge_alarm_enable", false);
     edge_bound_m_ = declare_parameter<double>("edge_bound_m", 4.5);
 
     const auto cmd_vel_topic = declare_parameter<std::string>("cmd_vel_topic", "/cmd_vel");
@@ -204,6 +205,11 @@ public:
     battery_ = std::clamp(battery_, 0, 100);
     last_battery_tick_ = now();
     last_alarm_demo_ = now();
+    // 关闭自动告警时清掉可能残留的演示急停，避免导航被永久拒绝
+    if (alarm_demo_period_sec_ <= 0.0) {
+      estop_ = false;
+      estop_hold_left_ = 0.0;
+    }
 
     const auto period = std::chrono::duration<double>(1.0 / std::max(1.0, pose_rate_hz_));
     timer_ = create_wall_timer(
@@ -358,6 +364,9 @@ private:
 
   void maybe_edge_alarm_locked()
   {
+    if (!edge_alarm_enable_) {
+      return;
+    }
     if (std::abs(pose_x_) > edge_bound_m_ || std::abs(pose_y_) > edge_bound_m_) {
       publish_alarm_locked(
         "edge_collision", "warn", "触边",
@@ -614,13 +623,14 @@ private:
   double bearing_yaw_tol_{0.08};
   double charge_near_m_{0.35};
   double status_accum_{0.0};
-  double alarm_demo_period_sec_{45.0};
+  double alarm_demo_period_sec_{0.0};
   double alarm_cooldown_sec_{25.0};
   double alarm_demo_estop_hold_sec_{8.0};
   double edge_bound_m_{4.5};
   double alarm_demo_accum_{0.0};
   double estop_hold_left_{0.0};
   int alarm_demo_idx_{0};
+  bool edge_alarm_enable_{false};
 
   double pose_x_{0.0};
   double pose_y_{0.0};
