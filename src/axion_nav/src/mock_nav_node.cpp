@@ -109,6 +109,7 @@ public:
     // 告警：定时轮播三种异常；0 关闭自动造异常
     alarm_demo_period_sec_ = declare_parameter<double>("alarm_demo_period_sec", 45.0);
     alarm_cooldown_sec_ = declare_parameter<double>("alarm_cooldown_sec", 25.0);
+    alarm_demo_estop_hold_sec_ = declare_parameter<double>("alarm_demo_estop_hold_sec", 8.0);
     edge_bound_m_ = declare_parameter<double>("edge_bound_m", 4.5);
 
     const auto cmd_vel_topic = declare_parameter<std::string>("cmd_vel_topic", "/cmd_vel");
@@ -262,6 +263,24 @@ private:
   void apply_estop_locked(const std::string & detail)
   {
     estop_ = true;
+    // 话题急停保持较长；演示注入用更短 hold（见 apply_demo_estop_locked）
+    estop_hold_left_ = -1.0;
+    if (navigating_) {
+      navigating_ = false;
+      phase_ = NavPhase::Idle;
+      pending_idle_ = false;
+      set_state_locked("idle");
+      clear_plan_locked();
+    }
+    publish_alarm_locked(
+      "emergency_stop", "critical", "急停", detail);
+  }
+
+  /** 演示急停：短时拉高 estop，到期自动解除，避免永久卡死导航 */
+  void apply_demo_estop_locked(const std::string & detail)
+  {
+    estop_ = true;
+    estop_hold_left_ = std::max(1.0, alarm_demo_estop_hold_sec_);
     if (navigating_) {
       navigating_ = false;
       phase_ = NavPhase::Idle;
@@ -333,7 +352,7 @@ private:
         "edge_collision", "warn", "触边",
         "mock: 保险杠/触边传感器触发（演示注入）");
     } else {
-      apply_estop_locked("mock: 急停回路断开（演示注入）");
+      apply_demo_estop_locked("mock: 急停回路断开（演示注入）");
     }
   }
 
@@ -562,6 +581,16 @@ private:
 
     publish_pose_locked();
 
+    // 演示急停到期自动解除
+    if (estop_ && estop_hold_left_ > 0.0) {
+      estop_hold_left_ -= dt;
+      if (estop_hold_left_ <= 0.0) {
+        estop_ = false;
+        estop_hold_left_ = 0.0;
+        RCLCPP_INFO(get_logger(), "demo estop cleared");
+      }
+    }
+
     maybe_edge_alarm_locked();
     maybe_demo_alarm_locked(dt);
 
@@ -587,8 +616,10 @@ private:
   double status_accum_{0.0};
   double alarm_demo_period_sec_{45.0};
   double alarm_cooldown_sec_{25.0};
+  double alarm_demo_estop_hold_sec_{8.0};
   double edge_bound_m_{4.5};
   double alarm_demo_accum_{0.0};
+  double estop_hold_left_{0.0};
   int alarm_demo_idx_{0};
 
   double pose_x_{0.0};
