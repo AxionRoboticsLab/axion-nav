@@ -238,6 +238,14 @@ private:
     state_pub_->publish(msg);
   }
 
+  void force_state_locked(const std::string & s)
+  {
+    nav_state_ = s;
+    std_msgs::msg::String msg;
+    msg.data = nav_state_;
+    state_pub_->publish(msg);
+  }
+
   void on_initialpose(const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg)
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -318,9 +326,8 @@ private:
       loc_ok_ = false;
     } else if (code == "edge_collision") {
       edge_hit_ = true;
-    } else if (code == "emergency_stop") {
-      estop_ = true;
     }
+    // emergency_stop 告警仅上报，不拉急停；急停只由 /estop 话题控制
 
     std::ostringstream oss;
     oss << '{'
@@ -358,7 +365,10 @@ private:
         "edge_collision", "warn", "触边",
         "mock: 保险杠/触边传感器触发（演示注入）");
     } else {
-      apply_demo_estop_locked("mock: 急停回路断开（演示注入）");
+      // 仅注入急停告警事件，不改变急停硬件态（避免告警导致车不动）
+      publish_alarm_locked(
+        "emergency_stop", "critical", "急停",
+        "mock: 急停告警演示（未拉起 /estop）");
     }
   }
 
@@ -389,9 +399,7 @@ private:
     std::lock_guard<std::mutex> lock(mutex_);
     if (estop_) {
       RCLCPP_WARN(get_logger(), "goal ignored: estop active");
-      publish_alarm_locked(
-        "emergency_stop", "critical", "急停",
-        "急停生效中，拒绝导航目标");
+      // 不因拒收 goal 再刷急停告警，避免告警风暴；由 UI 解除急停
       return;
     }
     goal_x_ = msg->pose.position.x;
@@ -407,7 +415,8 @@ private:
     // 三相：先对目标方位 → 直线前进 → 到位后转目标朝向
     const double already = std::hypot(goal_x_ - pose_x_, goal_y_ - pose_y_);
     phase_ = already <= goal_xy_tol_ ? NavPhase::AlignGoal : NavPhase::AlignBearing;
-    set_state_locked("navigating");
+    // 强制重发 navigating，避免「本来就在 navigating」时前端收不到状态跳变
+    force_state_locked("navigating");
     publish_plan_locked();
     RCLCPP_INFO(
       get_logger(), "goal_pose -> (%.2f, %.2f, yaw=%.2f)",
